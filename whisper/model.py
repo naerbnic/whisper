@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+from torch.nn import Conv1d, LayerNorm, Linear
 
 from .decoding import decode as decode_function
 from .decoding import detect_language as detect_language_function
@@ -26,28 +27,6 @@ class ModelDimensions:
     n_text_head: int
     n_text_layer: int
 
-
-class LayerNorm(nn.LayerNorm):
-    def forward(self, x: Tensor) -> Tensor:
-        return super().forward(x.float()).type(x.dtype)
-
-
-class Linear(nn.Linear):
-    def forward(self, x: Tensor) -> Tensor:
-        return F.linear(
-            x,
-            self.weight.to(x.dtype),
-            None if self.bias is None else self.bias.to(x.dtype),
-        )
-
-
-class Conv1d(nn.Conv1d):
-    def _conv_forward(
-        self, x: Tensor, weight: Tensor, bias: Optional[Tensor]
-    ) -> Tensor:
-        return super()._conv_forward(
-            x, weight.to(x.dtype), None if bias is None else bias.to(x.dtype)
-        )
 
 
 def sinusoids(length, channels, max_timescale=10000):
@@ -73,19 +52,19 @@ class MultiHeadAttention(nn.Module):
         x: Tensor,
         xa: Optional[Tensor] = None,
         mask: Optional[Tensor] = None,
-        kv_cache: Optional[dict] = None,
+        kv_cache: Optional[Dict[int, Tensor]] = None,
     ):
         q = self.query(x)
 
-        if kv_cache is None or xa is None or self.key not in kv_cache:
+        if kv_cache is None or xa is None or id(self.key) not in kv_cache:
             # hooks, if installed (i.e. kv_cache is not None), will prepend the cached kv tensors;
             # otherwise, perform key/value projections for self- or cross-attention as usual.
             k = self.key(x if xa is None else xa)
             v = self.value(x if xa is None else xa)
         else:
             # for cross-attention, calculate keys and values once and reuse in subsequent calls.
-            k = kv_cache[self.key]
-            v = kv_cache[self.value]
+            k = kv_cache[id(self.key)]
+            v = kv_cache[id(self.value)]
 
         wv, qk = self.qkv_attention(q, k, v, mask)
         return self.out(wv), qk
@@ -131,7 +110,7 @@ class ResidualAttentionBlock(nn.Module):
         x: Tensor,
         xa: Optional[Tensor] = None,
         mask: Optional[Tensor] = None,
-        kv_cache: Optional[dict] = None,
+        kv_cache: Optional[Dict[int, Tensor]] = None,
     ):
         x = x + self.attn(self.attn_ln(x), mask=mask, kv_cache=kv_cache)[0]
         if self.cross_attn:
@@ -193,7 +172,7 @@ class TextDecoder(nn.Module):
         mask = torch.empty(n_ctx, n_ctx).fill_(-np.inf).triu_(1)
         self.register_buffer("mask", mask, persistent=False)
 
-    def forward(self, x: Tensor, xa: Tensor, kv_cache: Optional[dict] = None):
+    def forward(self, x: Tensor, xa: Tensor, kv_cache: Optional[Dict[int, Tensor]] = None):
         """
         x : torch.LongTensor, shape = (batch_size, <= n_ctx)
             the text tokens
@@ -271,7 +250,7 @@ class Whisper(nn.Module):
     def is_multilingual(self):
         return self.dims.n_vocab == 51865
 
-    def install_kv_cache_hooks(self, cache: Optional[dict] = None):
+    def install_kv_cache_hooks(self, cache: Optional[Dict[int, Tensor]] = None):
         """
         The `MultiHeadAttention` module optionally accepts `kv_cache` which stores the key and value
         tensors calculated for the previous positions. This method returns a dictionary that stores
@@ -288,13 +267,13 @@ class Whisper(nn.Module):
         cache = {**cache} if cache is not None else {}
         hooks = []
 
-        def save_to_cache(module, _, output):
-            if module not in cache or output.shape[1] > self.dims.n_text_ctx:
+        def save_to_cache(module: nn.Module, _, output):
+            if id(module) not in cache or output.shape[1] > self.dims.n_text_ctx:
                 # save as-is, for the first token or cross attention
-                cache[module] = output
+                cache[id(module)] = output
             else:
-                cache[module] = torch.cat([cache[module], output], dim=1).detach()
-            return cache[module]
+                cache[id(module)] = torch.cat([cache[id(module)], output], dim=1).detach()
+            return cache[id(module)]
 
         def install_hooks(layer: nn.Module):
             if isinstance(layer, MultiHeadAttention):

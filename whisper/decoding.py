@@ -171,7 +171,7 @@ class PyTorchInference(Inference):
         if source_indices != list(range(len(source_indices))):
             for module in self.kv_modules:
                 # update the key/value cache to contain the selected sequences
-                self.kv_cache[module] = self.kv_cache[module][source_indices].detach()
+                self.kv_cache[id(module)] = self.kv_cache[id(module)][source_indices].detach()
 
 
 class SequenceRanker:
