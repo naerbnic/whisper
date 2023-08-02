@@ -158,7 +158,7 @@ class PyTorchInference(Inference):
             # only need to use the last token except in the first forward pass
             tokens = tokens[:, -1:]
 
-        return self.model.decoder(tokens, audio_features, kv_cache=self.kv_cache)
+        return self.model.decoder(tokens, audio_features, kv_cache=self.kv_cache)[0]
 
     def cleanup_caching(self):
         for hook in self.hooks:
