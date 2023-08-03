@@ -64,8 +64,11 @@ class MultiHeadAttention(nn.Module):
             # for cross-attention, calculate keys and values once and reuse in subsequent calls.
             k = kv_tensor[0]
             v = kv_tensor[1]
-            print(f"USING CACHED: module: {id(self)}, k.shape: {k.shape}, v.shape: {v.shape}")
 
+        if kv_tensor is not None and xa is None:
+            # This is a self-attention call, so we need to prepend the cached key/value tensors.
+            k = torch.cat([kv_tensor[0], k], dim=1)
+            v = torch.cat([kv_tensor[1], v], dim=1)
 
         wv, qk = self.qkv_attention(q, k, v, mask)
         return self.out(wv), qk, torch.stack([k, v]).detach()
@@ -119,12 +122,10 @@ class ResidualAttentionBlock(nn.Module):
             attn_kv_tensor = kv_tensors[0]
             cross_attn_kv_tensor = kv_tensors[1]
 
-        print(f'RAB KV TENSORS ATTN: {attn_kv_tensor is not None}')
         attn_result = self.attn(self.attn_ln(x), mask=mask, kv_tensor = attn_kv_tensor)
         x = x + attn_result[0]
         attn_kv_tensor = attn_result[2]
         if self.cross_attn is not None:
-            print(f'RAB KV TENSORS XATTN: {cross_attn_kv_tensor is not None}')
             cross_attn_result = self.cross_attn(self.cross_attn_ln(x), xa, kv_tensor = cross_attn_kv_tensor)
             x = x + cross_attn_result[0]
             cross_attn_kv_tensor = cross_attn_result[2]
@@ -185,7 +186,7 @@ class TextDecoder(nn.Module):
         mask = torch.empty(n_ctx, n_ctx).fill_(-np.inf).triu_(1)
         self.register_buffer("mask", mask, persistent=False)
 
-    def forward(self, x: Tensor, xa: Tensor, kv_tensors: Optional[Tuple[Tensor, Tensor]] = None) -> (Tensor, Tensor, Tensor):
+    def forward(self, x: Tensor, xa: Tensor, kv_tensors: Optional[Tuple[Tensor, Tensor]] = None) -> Tuple[Tensor, Tensor, Tensor]:
         """
         x : torch.LongTensor, shape = (batch_size, <= n_ctx)
             the text tokens
@@ -195,7 +196,6 @@ class TextDecoder(nn.Module):
         offset = 0
         if kv_tensors is not None:
             offset = kv_tensors[0].shape[3]
-            print(f'using attn tensors with shape {kv_tensors[0].shape}, offset = {offset}')
         x = (
             self.token_embedding(x)
             + self.positional_embedding[offset : offset + x.shape[-1]]
@@ -205,7 +205,7 @@ class TextDecoder(nn.Module):
         attn_kv_tensors = []
         cross_attn_kv_tensors = []
         for i, block in enumerate(self.blocks):
-            inner_kv_tensors = None
+            inner_kv_tensors: Optional[Tuple[Tensor, Tensor]] = None
             if kv_tensors is not None:
                 inner_kv_tensors = (kv_tensors[0][i], kv_tensors[1][i])
             x, attn_kv_tensor, cross_attn_kv_tensor = block(x, xa, mask=self.mask, kv_tensors=inner_kv_tensors)
@@ -225,13 +225,13 @@ class Whisper(nn.Module):
     def __init__(self, dims: ModelDimensions):
         super().__init__()
         self.dims = dims
-        self.encoder = AudioEncoder(
+        self.encoder = torch.jit.script(AudioEncoder(
             self.dims.n_mels,
             self.dims.n_audio_ctx,
             self.dims.n_audio_state,
             self.dims.n_audio_head,
             self.dims.n_audio_layer,
-        )
+        ))
         self.decoder = TextDecoder(
             self.dims.n_vocab,
             self.dims.n_text_ctx,
