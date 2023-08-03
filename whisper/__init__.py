@@ -5,6 +5,7 @@ import urllib
 import warnings
 from typing import List, Optional, Union
 
+import numpy as np
 import torch
 from tqdm import tqdm
 
@@ -146,6 +147,12 @@ def load_model(
 
     dims = ModelDimensions(**checkpoint["dims"])
     model = Whisper(dims)
+    # In order to work with torch.jit, add 'decoder.mask' entry to the state dict
+    if isinstance(model.decoder, torch.jit.ScriptModule):
+        checkpoint["model_state_dict"]["decoder.mask"] = (
+            torch.empty(dims.n_text_ctx, dims.n_text_ctx).fill_(-np.inf).triu_(1)
+        )
+
     model.load_state_dict(checkpoint["model_state_dict"])
 
     if alignment_heads is not None:

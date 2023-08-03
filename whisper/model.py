@@ -232,13 +232,13 @@ class Whisper(nn.Module):
             self.dims.n_audio_head,
             self.dims.n_audio_layer,
         ))
-        self.decoder = TextDecoder(
+        self.decoder = torch.jit.script(TextDecoder(
             self.dims.n_vocab,
             self.dims.n_text_ctx,
             self.dims.n_text_state,
             self.dims.n_text_head,
             self.dims.n_text_layer,
-        )
+        ))
         # use the last half layers for alignment by default; see `set_alignment_heads()` below
         all_heads = torch.zeros(
             self.dims.n_text_layer, self.dims.n_text_head, dtype=torch.bool
