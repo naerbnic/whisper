@@ -143,35 +143,47 @@ class PyTorchInference(Inference):
     def __init__(self, model: "Whisper", initial_token_length: int):
         self.model: "Whisper" = model
         self.initial_token_length = initial_token_length
-        self.kv_cache = {}
-        self.hooks = []
+        self.kv_tensors = None
 
         key_modules = [block.attn.key for block in self.model.decoder.blocks]
         value_modules = [block.attn.value for block in self.model.decoder.blocks]
         self.kv_modules = key_modules + value_modules
 
     def logits(self, tokens: Tensor, audio_features: Tensor) -> Tensor:
-        if not self.kv_cache:
-            self.kv_cache, self.hooks = self.model.install_kv_cache_hooks()
-
         if tokens.shape[-1] > self.initial_token_length:
             # only need to use the last token except in the first forward pass
             tokens = tokens[:, -1:]
+        
+        if self.kv_tensors is not None:
+            print(f'Running logits with cached kv tensors of shapes: {self.kv_tensors[0].shape}, {self.kv_tensors[1].shape}')
+        else:
+            print('Running logits with no cached kv tensors')
 
-        return self.model.decoder(tokens, audio_features, kv_cache=self.kv_cache)[0]
+        x, attn_kv_tensors, cross_attn_kv_tensors = self.model.decoder(tokens, audio_features, kv_tensors=self.kv_tensors)
+
+        if self.kv_tensors is None:
+            self.kv_tensors = (attn_kv_tensors, cross_attn_kv_tensors)
+            print(f'Got KV cached tensor with shapes: {self.kv_tensors[0].shape}, {self.kv_tensors[1].shape}')
+        else:
+            # We accumulate the attn vectors as used to be done in save_to_cache
+            print(f'Appending attn tensor to cached. Shapes: {self.kv_tensors[0].shape}, {attn_kv_tensors.shape}')
+            new_attn_kv_tensors = torch.cat([self.kv_tensors[0], attn_kv_tensors], dim = 3)
+            self.kv_tensors = (new_attn_kv_tensors, self.kv_tensors[1])
+            print(f'After append:: {self.kv_tensors[0].shape}')
+
+        return x
 
     def cleanup_caching(self):
-        for hook in self.hooks:
-            hook.remove()
-
-        self.kv_cache = {}
-        self.hooks = []
+        self.kv_tensors = None
 
     def rearrange_kv_cache(self, source_indices):
-        if source_indices != list(range(len(source_indices))):
-            for module in self.kv_modules:
-                # update the key/value cache to contain the selected sequences
-                self.kv_cache[id(module)] = self.kv_cache[id(module)][source_indices].detach()
+        if source_indices != list(range(len(source_indices))) and self.kv_tensors is not None:
+            print(f'Rearranging kv tensors with source indices: {source_indices}')
+            attn_kv_tensors = self.kv_tensors[0]
+            print(f"  Before rearrange: {attn_kv_tensors.shape}")
+            attn_kv_tensors = attn_kv_tensors[:, :, source_indices]
+            print(f"  After rearrange: {attn_kv_tensors.shape}")
+            self.kv_tensors = (attn_kv_tensors, self.kv_tensors[1])
 
 
 class SequenceRanker:
