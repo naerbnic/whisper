@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence, Tuple, Union, NamedTuple
 
 import numpy as np
 import torch
@@ -14,6 +14,13 @@ from .utils import compression_ratio
 if TYPE_CHECKING:
     from .model import Whisper
 
+class KVCacheEntry(NamedTuple):
+    k: Tensor
+    v: Tensor
+
+class KVBlockCacheEntry(NamedTuple):
+    attn: KVCacheEntry
+    cross_attn: KVCacheEntry
 
 @torch.no_grad()
 def detect_language(
@@ -139,38 +146,36 @@ class Inference:
         pass
 
 
+def rearrange_kv_cache_entry(source_indicies: List[int], entry: KVCacheEntry) -> KVCacheEntry:
+    return KVCacheEntry(k = entry.k[source_indicies], v = entry.v[source_indicies])
+
+def rearrange_kv_block_cache_entry(source_indicies: List[int], entry: KVBlockCacheEntry) -> KVBlockCacheEntry:
+    return KVBlockCacheEntry(
+        attn = rearrange_kv_cache_entry(source_indicies, entry.attn),
+        cross_attn= entry.cross_attn)
+
 class PyTorchInference(Inference):
     def __init__(self, model: "Whisper", initial_token_length: int):
         self.model: "Whisper" = model
         self.initial_token_length = initial_token_length
-        self.kv_tensors = None
-
-        key_modules = [block.attn.key for block in self.model.decoder.blocks]
-        value_modules = [block.attn.value for block in self.model.decoder.blocks]
-        self.kv_modules = key_modules + value_modules
+        self.kv_cache = None
 
     def logits(self, tokens: Tensor, audio_features: Tensor) -> Tensor:
         if tokens.shape[-1] > self.initial_token_length:
             # only need to use the last token except in the first forward pass
             tokens = tokens[:, -1:]
         
-        x, attn_kv_tensors, cross_attn_kv_tensors = self.model.decoder(tokens, audio_features, kv_tensors=self.kv_tensors)
-
-        if self.kv_tensors is None:
-            self.kv_tensors = (attn_kv_tensors, cross_attn_kv_tensors)
-        else:
-            self.kv_tensors = (attn_kv_tensors, self.kv_tensors[1])
+        x, self.kv_cache = self.model.decoder(tokens, audio_features, kv_cache=self.kv_cache)
 
         return x
 
     def cleanup_caching(self):
-        self.kv_tensors = None
+        self.kv_cache = None
 
     def rearrange_kv_cache(self, source_indices):
-        if source_indices != list(range(len(source_indices))) and self.kv_tensors is not None:
-            attn_kv_tensors = self.kv_tensors[0]
-            attn_kv_tensors = attn_kv_tensors[:, :, source_indices]
-            self.kv_tensors = (attn_kv_tensors, self.kv_tensors[1])
+        if source_indices != list(range(len(source_indices))) and self.kv_cache is not None:
+            for i in range(len(self.kv_cache)):
+                self.kv_cache[i] = rearrange_kv_block_cache_entry(source_indices, self.kv_cache[i])
 
 
 class SequenceRanker:

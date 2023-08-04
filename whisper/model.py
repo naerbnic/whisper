@@ -1,7 +1,7 @@
 import base64
 import gzip
 from dataclasses import dataclass
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Dict, Iterable, Optional, Tuple, List
 
 import numpy as np
 import torch
@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn import Conv1d, LayerNorm, Linear
 
+from .decoding import KVCacheEntry, KVBlockCacheEntry
 from .decoding import decode as decode_function
 from .decoding import detect_language as detect_language_function
 from .transcribe import transcribe as transcribe_function
@@ -51,27 +52,27 @@ class MultiHeadAttention(nn.Module):
         x: Tensor,
         xa: Optional[Tensor] = None,
         mask: Optional[Tensor] = None,
-        kv_tensor: Optional[Tensor] = None,
-    ):
+        cache_entry: Optional[KVCacheEntry] = None,
+    ) -> Tuple[Tensor, Tensor, KVCacheEntry]:
         q = self.query(x)
 
-        if kv_tensor is None or xa is None:
+        if cache_entry is None or xa is None:
             # hooks, if installed (i.e. kv_cache is not None), will prepend the cached kv tensors;
             # otherwise, perform key/value projections for self- or cross-attention as usual.
             k = self.key(x if xa is None else xa)
             v = self.value(x if xa is None else xa)
         else:
             # for cross-attention, calculate keys and values once and reuse in subsequent calls.
-            k = kv_tensor[0]
-            v = kv_tensor[1]
+            k = cache_entry.k
+            v = cache_entry.v
 
-        if kv_tensor is not None and xa is None:
+        if cache_entry is not None and xa is None:
             # This is a self-attention call, so we need to prepend the cached key/value tensors.
-            k = torch.cat([kv_tensor[0], k], dim=1)
-            v = torch.cat([kv_tensor[1], v], dim=1)
+            k = torch.cat([cache_entry.k, k], dim=1)
+            v = torch.cat([cache_entry.v, v], dim=1)
 
         wv, qk = self.qkv_attention(q, k, v, mask)
-        return self.out(wv), qk, torch.stack([k, v]).detach()
+        return self.out(wv), qk, KVCacheEntry(k = k, v = v)
 
     def qkv_attention(
         self, q: Tensor, k: Tensor, v: Tensor, mask: Optional[Tensor] = None
@@ -114,23 +115,26 @@ class ResidualAttentionBlock(nn.Module):
         x: Tensor,
         xa: Optional[Tensor] = None,
         mask: Optional[Tensor] = None,
-        kv_tensors: Optional[Tuple[Tensor, Tensor]] = None,
-    ):
-        attn_kv_tensor: Optional[Tensor] = None
-        cross_attn_kv_tensor: Optional[Tensor] = None
-        if kv_tensors is not None:
-            attn_kv_tensor = kv_tensors[0]
-            cross_attn_kv_tensor = kv_tensors[1]
+        block_cache_entry: Optional[KVBlockCacheEntry] = None,
+    ) -> Tuple[Tensor, Optional[KVBlockCacheEntry]]:
+        attn_kv_tensor: Optional[KVCacheEntry] = None
+        cross_attn_kv_tensor: Optional[KVCacheEntry] = None
+        if block_cache_entry is not None:
+            attn_kv_tensor = block_cache_entry.attn
+            cross_attn_kv_tensor = block_cache_entry.cross_attn
 
-        attn_result = self.attn(self.attn_ln(x), mask=mask, kv_tensor = attn_kv_tensor)
+        attn_result = self.attn(self.attn_ln(x), mask=mask, cache_entry = attn_kv_tensor)
         x = x + attn_result[0]
         attn_kv_tensor = attn_result[2]
         if self.cross_attn is not None:
-            cross_attn_result = self.cross_attn(self.cross_attn_ln(x), xa, kv_tensor = cross_attn_kv_tensor)
+            cross_attn_result = self.cross_attn(self.cross_attn_ln(x), xa, cache_entry = cross_attn_kv_tensor)
             x = x + cross_attn_result[0]
             cross_attn_kv_tensor = cross_attn_result[2]
         x = x + self.mlp(self.mlp_ln(x))
-        return x, attn_kv_tensor, cross_attn_kv_tensor
+        if attn_kv_tensor is None or cross_attn_kv_tensor is None:
+            return x, None
+        else:
+            return x, KVBlockCacheEntry(attn=attn_kv_tensor, cross_attn=cross_attn_kv_tensor)
 
 
 class AudioEncoder(nn.Module):
@@ -186,7 +190,7 @@ class TextDecoder(nn.Module):
         mask = torch.empty(n_ctx, n_ctx).fill_(-np.inf).triu_(1)
         self.register_buffer("mask", mask, persistent=False)
 
-    def forward(self, x: Tensor, xa: Tensor, kv_tensors: Optional[Tuple[Tensor, Tensor]] = None) -> Tuple[Tensor, Tensor, Tensor]:
+    def forward(self, x: Tensor, xa: Tensor, kv_cache: Optional[List[KVBlockCacheEntry]] = None) -> Tuple[Tensor, List[KVBlockCacheEntry]]:
         """
         x : torch.LongTensor, shape = (batch_size, <= n_ctx)
             the text tokens
@@ -194,23 +198,22 @@ class TextDecoder(nn.Module):
             the encoded audio features to be attended on
         """
         offset = 0
-        if kv_tensors is not None:
-            offset = kv_tensors[0].shape[3]
+        if kv_cache is not None:
+            offset = kv_cache[0].attn.k.shape[1]
         x = (
             self.token_embedding(x)
             + self.positional_embedding[offset : offset + x.shape[-1]]
         )
         x = x.to(xa.dtype)
 
-        attn_kv_tensors = []
-        cross_attn_kv_tensors = []
+        new_block_cache_entries: List[KVBlockCacheEntry] = []
         for i, block in enumerate(self.blocks):
-            inner_kv_tensors: Optional[Tuple[Tensor, Tensor]] = None
-            if kv_tensors is not None:
-                inner_kv_tensors = (kv_tensors[0][i], kv_tensors[1][i])
-            x, attn_kv_tensor, cross_attn_kv_tensor = block(x, xa, mask=self.mask, kv_tensors=inner_kv_tensors)
-            attn_kv_tensors.append(attn_kv_tensor)
-            cross_attn_kv_tensors.append(cross_attn_kv_tensor)
+            inner_kv_cache: Optional[KVBlockCacheEntry] = None
+            if kv_cache is not None:
+                inner_kv_cache = kv_cache[i]
+            x, new_block_cache_entry = block(x, xa, mask=self.mask, block_cache_entry=inner_kv_cache)
+            assert new_block_cache_entry is not None
+            new_block_cache_entries.append(new_block_cache_entry)
 
 
         x = self.ln(x)
@@ -218,7 +221,7 @@ class TextDecoder(nn.Module):
             x @ torch.transpose(self.token_embedding.weight.to(x.dtype), 0, 1)
         ).float()
 
-        return logits, torch.stack(attn_kv_tensors).detach(), torch.stack(cross_attn_kv_tensors).detach()
+        return logits, new_block_cache_entries
 
 
 class Whisper(nn.Module):
