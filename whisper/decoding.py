@@ -12,7 +12,7 @@ from .tokenizer import Tokenizer, get_tokenizer
 from .utils import compression_ratio
 
 if TYPE_CHECKING:
-    from .model import Whisper
+    from .model import Whisper, InferenceDecoder
 
 class KVCacheEntry(NamedTuple):
     k: Tensor
@@ -155,27 +155,20 @@ def rearrange_kv_block_cache_entry(source_indicies: List[int], entry: KVBlockCac
         cross_attn= entry.cross_attn)
 
 class PyTorchInference(Inference):
-    def __init__(self, model: "Whisper", initial_token_length: int):
-        self.model: "Whisper" = model
-        self.initial_token_length = initial_token_length
-        self.kv_cache = None
+    def __init__(self, decoder: "InferenceDecoder", initial_token_length: int):
+        self.decoder: "InferenceDecoder" = decoder
+        self.decoder.initialize_decoding(initial_token_length)
 
     def logits(self, tokens: Tensor, audio_features: Tensor) -> Tensor:
-        if tokens.shape[-1] > self.initial_token_length:
-            # only need to use the last token except in the first forward pass
-            tokens = tokens[:, -1:]
-        
-        x, self.kv_cache = self.model.decoder(tokens, audio_features, kv_cache=self.kv_cache)
+        return self.decoder(tokens, audio_features)
 
         return x
 
     def cleanup_caching(self):
-        self.kv_cache = None
+        self.decoder.cleanup_caching()
 
     def rearrange_kv_cache(self, source_indices):
-        if source_indices != list(range(len(source_indices))) and self.kv_cache is not None:
-            for i in range(len(self.kv_cache)):
-                self.kv_cache[i] = rearrange_kv_block_cache_entry(source_indices, self.kv_cache[i])
+        self.decoder.rearrange_kv_cache(torch.IntTensor(source_indices))
 
 
 class SequenceRanker:
@@ -536,7 +529,7 @@ class DecodingTask:
         self.sot_index: int = self.initial_tokens.index(tokenizer.sot)
 
         # inference: implements the forward pass through the decoder, including kv caching
-        self.inference = PyTorchInference(model, len(self.initial_tokens))
+        self.inference = PyTorchInference(model.get_inference_decoder(), len(self.initial_tokens))
 
         # sequence ranker: implements how to rank a group of sampled sequences
         self.sequence_ranker = MaximumLikelihoodRanker(options.length_penalty)
@@ -656,7 +649,7 @@ class DecodingTask:
         if audio_features.dtype != (
             torch.float16 if self.options.fp16 else torch.float32
         ):
-            return TypeError(
+            raise TypeError(
                 f"audio_features has an incorrect dtype: {audio_features.dtype}"
             )
 
