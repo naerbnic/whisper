@@ -40,6 +40,110 @@ def sinusoids(length, channels, max_timescale=10000):
     return torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], dim=1)
 
 
+@torch.jit.script
+class DecoderKeyValueCacheEntry:
+    def __init__(self):
+        new_cached_pair: Optional[Tuple[Tensor, Tensor]] = None
+        self._cached_pair = new_cached_pair
+
+    def clear(self):
+        self._cached_pair = None
+
+    def has_value(self):
+        return self._cached_pair is not None
+    
+    def get_key_value(self) -> Tuple[Tensor, Tensor]:
+        cached_pair = self._cached_pair
+        assert cached_pair is not None
+        return cached_pair
+
+    def set(self, keys: Tensor, values: Tensor):
+        self._cached_pair = (keys, values)
+
+    def push_layer(self, keys: Tensor, values: Tensor) -> Tuple[Tensor, Tensor]:
+        curr_keys, curr_values = self.get_key_value()
+        new_keys = torch.cat([curr_keys, keys], dim=1)
+        new_values = torch.cat([curr_values, values], dim=1)
+        self._cached_pair = (new_keys, new_values)
+        return new_keys, new_values
+
+@torch.jit.script
+class DecoderKeyValueBlockCacheEntry:
+    def __init__(self):
+        self._attn = DecoderKeyValueCacheEntry()
+        self._cross_attn = DecoderKeyValueCacheEntry()
+
+    def clear(self):
+        self._attn.clear()
+        self._cross_attn.clear()
+
+    def attn(self) -> DecoderKeyValueCacheEntry:
+        return self._attn
+
+    def cross_attn(self) -> DecoderKeyValueCacheEntry:
+        return self._cross_attn
+
+@torch.jit.script
+class DecoderKeyValueCache:
+    layers: List[DecoderKeyValueBlockCacheEntry]
+    def __init__(self, n_layer: int):
+        self.layers = [DecoderKeyValueBlockCacheEntry() for _ in range(n_layer)]
+
+    def clear(self):
+        for layer in self.layers:
+            layer.clear()
+
+    def get_block(self, layer: int) -> DecoderKeyValueBlockCacheEntry:
+        return self.layers[layer]
+
+@torch.jit.script
+def qkv_attention(
+    n_head: int, q: Tensor, k: Tensor, v: Tensor, mask: Optional[Tensor] = None
+):
+    n_batch, n_ctx, n_state = q.shape
+    scale = (n_state // n_head) ** -0.25
+    q = q.view(q.shape[0], q.shape[1], n_head, -
+                1).permute(0, 2, 1, 3) * scale
+    k = k.view(k.shape[0], k.shape[1], n_head, -
+                1).permute(0, 2, 3, 1) * scale
+    v = v.view(v.shape[0], v.shape[1], n_head, -1).permute(0, 2, 1, 3)
+
+    qk = q @ k
+    if mask is not None:
+        qk = qk + mask[:n_ctx, :n_ctx]
+    qk = qk.float()
+
+    w = F.softmax(qk, dim=-1).to(q.dtype)
+    return (w @ v).permute(0, 2, 1, 3).flatten(start_dim=2), qk.detach()
+
+
+class MultiHeadCrossAttention(nn.Module):
+    def __init__(self, n_state: int, n_head: int):
+        super().__init__()
+        self.n_head = n_head
+        self.query = Linear(n_state, n_state)
+        self.key = Linear(n_state, n_state, bias=False)
+        self.value = Linear(n_state, n_state)
+        self.out = Linear(n_state, n_state)
+
+    def forward(
+        self,
+        x: Tensor,
+        xa: Tensor,
+        cache_entry: Optional[KVCacheEntry] = None,
+    ) -> Tuple[Tensor, Tensor, KVCacheEntry]:
+        q = self.query(x)
+        if cache_entry is None:
+            k = self.key(xa)
+            v = self.value(xa)
+        else:
+            k = cache_entry.k
+            v = cache_entry.v
+            
+        wv, qk = qkv_attention(self.n_head, q, k, v)
+        return self.out(wv), qk, KVCacheEntry(k=k, v=v)
+
+
 class MultiHeadAttention(nn.Module):
     def __init__(self, n_state: int, n_head: int):
         super().__init__()
@@ -58,42 +162,18 @@ class MultiHeadAttention(nn.Module):
     ) -> Tuple[Tensor, Tensor, KVCacheEntry]:
         q = self.query(x)
 
-        if cache_entry is None or xa is None:
-            # hooks, if installed (i.e. kv_cache is not None), will prepend the cached kv tensors;
-            # otherwise, perform key/value projections for self- or cross-attention as usual.
-            k = self.key(x if xa is None else xa)
-            v = self.value(x if xa is None else xa)
-        else:
-            # for cross-attention, calculate keys and values once and reuse in subsequent calls.
-            k = cache_entry.k
-            v = cache_entry.v
+        # hooks, if installed (i.e. kv_cache is not None), will prepend the cached kv tensors;
+        # otherwise, perform key/value projections for self- or cross-attention as usual.
+        k = self.key(x)
+        v = self.value(x)
 
-        if cache_entry is not None and xa is None:
+        if cache_entry is not None:
             # This is a self-attention call, so we need to prepend the cached key/value tensors.
             k = torch.cat([cache_entry.k, k], dim=1)
             v = torch.cat([cache_entry.v, v], dim=1)
 
-        wv, qk = self.qkv_attention(q, k, v, mask)
+        wv, qk = qkv_attention(self.n_head, q, k, v, mask)
         return self.out(wv), qk, KVCacheEntry(k=k, v=v)
-
-    def qkv_attention(
-        self, q: Tensor, k: Tensor, v: Tensor, mask: Optional[Tensor] = None
-    ):
-        n_batch, n_ctx, n_state = q.shape
-        scale = (n_state // self.n_head) ** -0.25
-        q = q.view(q.shape[0], q.shape[1], self.n_head, -
-                   1).permute(0, 2, 1, 3) * scale
-        k = k.view(k.shape[0], k.shape[1], self.n_head, -
-                   1).permute(0, 2, 3, 1) * scale
-        v = v.view(v.shape[0], v.shape[1], self.n_head, -1).permute(0, 2, 1, 3)
-
-        qk = q @ k
-        if mask is not None:
-            qk = qk + mask[:n_ctx, :n_ctx]
-        qk = qk.float()
-
-        w = F.softmax(qk, dim=-1).to(q.dtype)
-        return (w @ v).permute(0, 2, 1, 3).flatten(start_dim=2), qk.detach()
 
 
 class ResidualAttentionBlock(nn.Module):
@@ -104,7 +184,7 @@ class ResidualAttentionBlock(nn.Module):
         self.attn_ln = LayerNorm(n_state)
 
         self.cross_attn = (
-            MultiHeadAttention(n_state, n_head) if cross_attention else None
+            MultiHeadCrossAttention(n_state, n_head) if cross_attention else None
         )
         self.cross_attn_ln = LayerNorm(n_state) if cross_attention else None
 
@@ -132,6 +212,7 @@ class ResidualAttentionBlock(nn.Module):
         x = x + attn_result[0]
         attn_kv_tensor = attn_result[2]
         if self.cross_attn is not None:
+            assert xa is not None
             cross_attn_result = self.cross_attn(
                 self.cross_attn_ln(x), xa, cache_entry=cross_attn_kv_tensor)
             x = x + cross_attn_result[0]
